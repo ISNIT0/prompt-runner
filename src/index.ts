@@ -1,13 +1,15 @@
+import { ConsoleInferenceLogger } from "./logger";
 import { OAITextDavinci3Provider } from "./openai";
-import { IInferenceRequest, infer } from "./promptRunner";
+import { IInferenceRequest, llmApp } from "./promptRunner";
 
 const questionGuardPrompt: IInferenceRequest<{ input: string }> = {
+  friendlyName: "Question Guard",
   prompt: async ({ input }) => {
     return `Is "${input}" a question that an analyst might ask about their product? Answer exactly as one of 'yes' or 'no' in lower case
 A: `;
   },
   validation: {
-    enum: ["Yes", "no"], // If output is not one of these values, retry or fail
+    enum: ["yes", "no"], // If output is not one of these values, retry or fail
   },
   retry: {
     max: 3, // Number of retries before failing
@@ -18,6 +20,7 @@ const eventTypeSelectionPrompt: IInferenceRequest<{
   input: string;
   eventTypes: string[];
 }> = {
+  friendlyName: "Event Type Selection",
   prompt: async ({ input, eventTypes }) => {
     return `Select between 0 and 3 events from below that best answer the question "${input}":
 ${eventTypes.join("\n")}
@@ -37,19 +40,27 @@ A: `;
   },
 };
 
-// Things to think about
-// 1. Grouping inferences by inference flow so they can be grouped together in logging
-//
-
 async function app() {
   const dav3Provider = new OAITextDavinci3Provider();
 
-  const ret = await infer(dav3Provider, questionGuardPrompt, {
-    input: "How many users logged in over the last month?",
-    // input: "How many bananas?",
-  });
+  const finalOutput = await llmApp<string>(
+    ConsoleInferenceLogger,
+    "My First App",
+    async (infer) => {
+      const ret = await infer(dav3Provider, questionGuardPrompt, {
+        input: "How many users logged in over the last month?",
+        // input: "How many bananas?",
+      });
 
-  console.info(`Output:`, ret);
+      if (ret) {
+        return "Success! " + ret;
+      } else {
+        return "Failed!";
+      }
+    }
+  );
+
+  console.info(`Output:`, finalOutput);
 }
 
 app().catch((err) => console.error(err));

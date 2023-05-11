@@ -1,3 +1,8 @@
+import {
+  IInferenceLogger,
+  IInferenceLoggerConstructor,
+} from "./logger";
+
 export interface IInferenceValidation<TMergeData extends Record<string, any>> {
   enum?: string[];
   type?: "json" | "string" | "number" | "boolean";
@@ -13,11 +18,20 @@ export interface IInferenceRequest<
   TMergeData extends Record<string, any>,
   TPromptFormat = string // e.g. Chat optimized or text completion
 > {
+  friendlyName: string;
   prompt(mergeData: TMergeData): Promise<TPromptFormat>;
   inferenceConfig?: IModelInferenceConfig;
   validation?: IInferenceValidation<TMergeData>;
   retry?: IInferenceRetryConfig<TMergeData>;
 }
+
+export type ICompiledInferenceRequest<
+  TMergeData extends Record<string, any>,
+  TPromptFormat = string
+> = IInferenceRequest<TMergeData, TPromptFormat> & {
+  inferenceId: string;
+  rawPrompt: TPromptFormat;
+};
 
 export interface IModelInferenceConfig {
   temperature: number;
@@ -25,6 +39,23 @@ export interface IModelInferenceConfig {
 const DEFAULT_INFERENCE_CONFIG = {
   temperature: 0.7,
 };
+
+async function compileInferenceRequest<
+  TMergeData extends Record<string, any>,
+  TPromptFormat
+>(
+  inferenceRequest: IInferenceRequest<TMergeData, TPromptFormat>,
+  mergeData: TMergeData
+): Promise<ICompiledInferenceRequest<TMergeData, TPromptFormat>> {
+  const rawPrompt = await inferenceRequest.prompt(mergeData);
+
+  return {
+    ...inferenceRequest,
+    // TODO: better ids
+    inferenceId: `ir-${inferenceRequest.friendlyName}-${Date.now()}`,
+    rawPrompt,
+  };
+}
 
 export interface IModelProvider<TPromptFormat> {
   infer(config: IModelInferenceConfig, prompt: TPromptFormat): Promise<string>;
@@ -34,41 +65,58 @@ export async function infer<
   TMergeData extends Record<string, any>,
   TPromptFormat
 >(
+  logger: IInferenceLogger,
   modelProvider: IModelProvider<TPromptFormat>,
-  {
-    prompt,
-    inferenceConfig,
-    validation,
-    retry,
-  }: IInferenceRequest<TMergeData, TPromptFormat>,
+  inferenceRequest: IInferenceRequest<TMergeData, TPromptFormat>,
   mergeData: TMergeData,
   retriesCount = 0
 ): Promise<string> {
-  const finalPrompt = await prompt(mergeData);
-  const inferenceResult = await modelProvider.infer(
-    inferenceConfig || DEFAULT_INFERENCE_CONFIG,
-    finalPrompt
+  const { inferenceConfig, validation, retry } = inferenceRequest;
+
+  const compiledInferenceRequest = await compileInferenceRequest(
+    inferenceRequest,
+    mergeData
   );
 
+  logger.inferenceStarted(compiledInferenceRequest, mergeData, retriesCount);
+  const inferenceResult = await modelProvider.infer(
+    inferenceConfig || DEFAULT_INFERENCE_CONFIG,
+    compiledInferenceRequest.rawPrompt
+  );
   const treatedResult = inferenceResult.trim();
+  logger.inferenceCompleted(
+    compiledInferenceRequest,
+    mergeData,
+    retriesCount,
+    treatedResult
+  );
 
   const validationResult = validation
     ? await validateInferenceResult(treatedResult, validation, mergeData)
     : true;
-  // TODO: Log validation result
+  logger.validationCompleted(
+    compiledInferenceRequest,
+    mergeData,
+    retriesCount,
+    validationResult
+  );
 
   if (validationResult) {
     return treatedResult;
   } else {
-    console.info(`Validation Failed: [${treatedResult}]`, validation);
+    console.info(
+      `Validation Failed: [${treatedResult}] does not pass validation rules -`,
+      validation
+    );
     if (retry && retriesCount < retry.max) {
       let shouldRetry = retry.fn ? retry.fn(treatedResult, mergeData) : true;
       if (shouldRetry) {
         // TODO: Log retry
         console.info(`Retrying [${retriesCount + 1}]`);
         return infer(
+          logger,
           modelProvider,
-          { prompt, inferenceConfig, validation, retry },
+          inferenceRequest,
           mergeData,
           retriesCount + 1
         );
@@ -114,4 +162,40 @@ export async function validateInferenceResult<
     }
   }
   return true;
+}
+
+function makeAppInfer(logger: IInferenceLogger) {
+  return function appInfer<
+    TMergeData extends Record<string, any>,
+    TPromptFormat
+  >(
+    modelProvider: IModelProvider<TPromptFormat>,
+    inferenceRequest: IInferenceRequest<TMergeData, TPromptFormat>,
+    mergeData: TMergeData,
+    retriesCount = 0
+  ) {
+    return infer(
+      logger,
+      modelProvider,
+      inferenceRequest,
+      mergeData,
+      retriesCount
+    );
+  };
+}
+
+type AppInfer = ReturnType<typeof makeAppInfer>;
+export type ILLMApp<T> = (_infer: AppInfer) => Promise<T>;
+export async function llmApp<T>(
+  LoggerClass: IInferenceLoggerConstructor,
+  appName: string,
+  doApp: ILLMApp<T>
+) {
+  const logger = new LoggerClass(appName);
+
+  const appInfer = makeAppInfer(logger);
+
+  const result = await doApp(appInfer);
+
+  return result;
 }
